@@ -3,16 +3,17 @@ Implements a Variational Sparse Autoencoder with Gaussian Mixture Prior.
 Designed to better model correlated and anti-correlated feature pairs.
 """
 import torch as t
-from typing import Optional, List, Dict, Any, Tuple
-import torch.nn.functional as F
+from typing import Optional, List, Dict, Tuple
 from collections import namedtuple
 
-from ..trainers.trainer import SAETrainer, get_lr_schedule, get_sparsity_warmup_fn
+from ..trainers.trainer import SAETrainer, get_lr_schedule, get_sparsity_warmup_fn, ConstrainedAdam
+from ..dictionary import Dictionary
 from ..config import DEBUG
 
-class VSAEMixtureTrainer(SAETrainer):
+
+class VSAEMixDict(Dictionary, t.nn.Module):
     """
-    Variational Sparse Autoencoder with Gaussian Mixture Prior.
+    Variational Sparse Autoencoder with Gaussian Mixture Prior
     
     This extends the isotropic Gaussian VSAE by using a mixture of Gaussians
     as the prior distribution to better model correlated and anti-correlated
@@ -22,6 +23,131 @@ class VSAEMixtureTrainer(SAETrainer):
     - Correlated pairs: Both features have positive means
     - Anti-correlated pairs: One feature has positive mean, the other negative
     - Uncorrelated features: Zero mean (standard prior)
+    """
+    
+    def __init__(self, activation_dim, dict_size):
+        super().__init__()
+        self.activation_dim = activation_dim
+        self.dict_size = dict_size
+        
+        # Initialize encoder and decoder parameters
+        self.W_enc = t.nn.Parameter(t.empty(activation_dim, dict_size))
+        self.b_enc = t.nn.Parameter(t.zeros(dict_size))
+        self.W_dec = t.nn.Parameter(t.empty(dict_size, activation_dim))
+        self.b_dec = t.nn.Parameter(t.zeros(activation_dim))
+        
+        # Initialize with Kaiming uniform
+        t.nn.init.kaiming_uniform_(self.W_enc)
+        t.nn.init.kaiming_uniform_(self.W_dec)
+        
+        # Normalize decoder weights
+        self.normalize_decoder()
+        
+    def encode(self, x, output_log_var=False):
+        """
+        Encode a vector x in the activation space.
+        
+        Args:
+            x: Input tensor
+            output_log_var: Whether to output log_var (always False without variance params)
+            
+        Returns:
+            Encoded features (and log_var if output_log_var=True)
+        """
+        x_cent = x - self.b_dec
+        z = t.nn.functional.relu(x_cent @ self.W_enc + self.b_enc)
+        
+        if output_log_var:
+            # Fixed variance
+            log_var = t.zeros_like(z)
+            return z, log_var
+        return z
+    
+    def decode(self, f):
+        """
+        Decode a dictionary vector f
+        
+        Args:
+            f: Dictionary vector
+            
+        Returns:
+            Decoded vector
+        """
+        return f @ self.W_dec + self.b_dec
+    
+    def forward(self, x, output_features=False):
+        """
+        Forward pass through the autoencoder.
+        """
+        f = self.encode(x)
+        x_hat = self.decode(f)
+        
+        if output_features:
+            return x_hat, f
+        else:
+            return x_hat
+    
+    @t.no_grad()
+    def normalize_decoder(self):
+        """Normalize decoder weights to have unit norm"""
+        norm = t.norm(self.W_dec, dim=1, keepdim=True)
+        self.W_dec.data = self.W_dec.data / norm.clamp(min=1e-6)
+    
+    def scale_biases(self, scale: float):
+        """Scale biases by a factor"""
+        self.b_dec.data *= scale
+        self.b_enc.data *= scale
+    
+    @classmethod
+    def from_pretrained(cls, path, device=None):
+        """Load a pretrained autoencoder from a file."""
+        state_dict = t.load(path)
+        activation_dim, dict_size = state_dict["W_enc"].shape
+        autoencoder = cls(activation_dim, dict_size)
+        autoencoder.load_state_dict(state_dict)
+        if device is not None:
+            autoencoder.to(device)
+        return autoencoder
+
+
+class VSAEMixVarDict(VSAEMixDict):
+    """VSAEMixDict with learned variance parameters"""
+    
+    def __init__(self, activation_dim, dict_size):
+        super().__init__(activation_dim, dict_size)
+        
+        # Add variance parameters
+        self.W_enc_var = t.nn.Parameter(t.empty(activation_dim, dict_size))
+        self.b_enc_var = t.nn.Parameter(t.zeros(dict_size))
+        
+        # Initialize
+        t.nn.init.kaiming_uniform_(self.W_enc_var)
+    
+    def encode(self, x, output_log_var=False):
+        """
+        Encode with learned variance.
+        """
+        x_cent = x - self.b_dec
+        z = t.nn.functional.relu(x_cent @ self.W_enc + self.b_enc)
+        
+        if output_log_var:
+            log_var = t.nn.functional.relu(x_cent @ self.W_enc_var + self.b_enc_var)
+            return z, log_var
+        return z
+    
+    def scale_biases(self, scale: float):
+        """Scale all biases"""
+        super().scale_biases(scale)
+        self.b_enc_var.data *= scale
+
+
+class VSAEMixTrainer(SAETrainer):
+    """
+    Variational Sparse Autoencoder with Gaussian Mixture Prior.
+    
+    This extends the isotropic Gaussian VSAE by using a mixture of Gaussians
+    as the prior distribution to better model correlated and anti-correlated
+    feature pairs.
     """
     
     def __init__(self,
@@ -41,7 +167,7 @@ class VSAEMixtureTrainer(SAETrainer):
                  correlation_prior_scale: float = 1.0,  # scale for correlation prior
                  seed: Optional[int] = None,
                  device = None,
-                 wandb_name: Optional[str] = 'VSAEMixtureTrainer',
+                 wandb_name: Optional[str] = 'VSAEMixTrainer',
                  submodule_name: Optional[str] = None,
                 ):
         super().__init__(seed)
@@ -56,8 +182,13 @@ class VSAEMixtureTrainer(SAETrainer):
             t.manual_seed(seed)
             t.cuda.manual_seed_all(seed)
             
-        self.activation_dim = activation_dim
-        self.dict_size = dict_size
+        # Initialize dictionary based on var_flag
+        if var_flag == 0:
+            self.ae = VSAEMixDict(activation_dim, dict_size)
+        else:
+            self.ae = VSAEMixVarDict(activation_dim, dict_size)
+            
+        self.lr = 1e-4  # Default learning rate
         self.kl_coeff = kl_coeff
         self.warmup_steps = warmup_steps
         self.sparsity_warmup_steps = sparsity_warmup_steps
@@ -74,26 +205,7 @@ class VSAEMixtureTrainer(SAETrainer):
         else:
             self.device = device
             
-        # Initialize encoder and decoder parameters
-        self.W_enc = t.nn.Parameter(t.empty(activation_dim, dict_size, device=self.device))
-        self.b_enc = t.nn.Parameter(t.zeros(dict_size, device=self.device))
-        
-        if self.var_flag == 1:
-            self.W_enc_var = t.nn.Parameter(t.empty(activation_dim, dict_size, device=self.device))
-            self.b_enc_var = t.nn.Parameter(t.zeros(dict_size, device=self.device))
-            
-        self.W_dec = t.nn.Parameter(t.empty(dict_size, activation_dim, device=self.device))
-        self.b_dec = t.nn.Parameter(t.zeros(activation_dim, device=self.device))
-        
-        # Initialize parameters with Kaiming uniform
-        t.nn.init.kaiming_uniform_(self.W_enc)
-        t.nn.init.kaiming_uniform_(self.W_dec)
-        
-        if self.var_flag == 1:
-            t.nn.init.kaiming_uniform_(self.W_enc_var)
-            
-        # Normalize decoder weights
-        self.normalize_decoder()
+        self.ae.to(self.device)
         
         # Initialize the prior means based on correlation structure
         self.prior_means = self._initialize_prior_means()
@@ -102,18 +214,17 @@ class VSAEMixtureTrainer(SAETrainer):
         self.resample_steps = resample_steps
         if self.resample_steps is not None:
             # How many steps since each neuron was last activated?
-            self.steps_since_active = t.zeros(dict_size, dtype=int).to(self.device)
+            self.steps_since_active = t.zeros(dict_size, dtype=t.long).to(self.device)
         else:
             self.steps_since_active = None
         
-        # Create optimizer
-        self.optimizer = t.optim.Adam(self.parameters(), lr=1e-4)
+        # Create optimizer with constraints on decoder weights
+        self.optimizer = ConstrainedAdam(self.ae.parameters(), [self.ae.W_dec], lr=self.lr)
         
-        # Create learning rate scheduler
+        # Create learning rate and sparsity schedules
         lr_fn = get_lr_schedule(steps, warmup_steps, decay_start, resample_steps, sparsity_warmup_steps)
         self.scheduler = t.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_fn)
         
-        # Create sparsity warmup function
         self.sparsity_warmup_fn = get_sparsity_warmup_fn(steps, sparsity_warmup_steps)
         
         # Add tracking metrics for logging
@@ -123,11 +234,8 @@ class VSAEMixtureTrainer(SAETrainer):
         """
         Initialize the prior means for the latent variables based on 
         the specified correlation structure.
-        
-        Returns:
-            prior_means: Tensor of shape [dict_size] with means for the prior distribution
         """
-        means = t.zeros(self.dict_size, device=self.device)
+        means = t.zeros(self.ae.dict_size, device=self.device)
         scale = self.correlation_prior_scale
         
         # Process correlated pairs
@@ -143,26 +251,12 @@ class VSAEMixtureTrainer(SAETrainer):
             means[offset + 2*i] = scale
             means[offset + 2*i + 1] = -scale
         
-        # The remaining features have zero mean (standard prior)
         return means
-    
-    @t.no_grad()
-    def normalize_decoder(self):
-        """Normalize decoder weights to have unit norm"""
-        norm = self.W_dec.norm(dim=-1, keepdim=True)
-        self.W_dec.data = self.W_dec.data / norm.clamp(min=1e-6)
     
     def reparameterize(self, mu: t.Tensor, log_var: t.Tensor) -> t.Tensor:
         """
         Apply the reparameterization trick:
         z = mu + eps * sigma, where eps ~ N(0, 1)
-        
-        Args:
-            mu: Mean of latent distribution, shape [batch_size, dict_size]
-            log_var: Log variance of latent distribution, shape [batch_size, dict_size]
-            
-        Returns:
-            Sampled latent variable z, shape [batch_size, dict_size]
         """
         std = t.exp(0.5 * log_var)
         eps = t.randn_like(std)
@@ -172,19 +266,8 @@ class VSAEMixtureTrainer(SAETrainer):
         """
         Compute KL divergence between q(z|x) = N(mu, sigma^2) and 
         the mixture prior distribution p(z) with structured means.
-        
-        For a Gaussian with non-zero mean prior:
-        KL(N(mu, sigma^2) || N(prior_mu, 1)) = 
-            0.5 * [log(1/sigma^2) + sigma^2 + (mu-prior_mu)^2 - 1]
-        
-        Args:
-            mu: Mean of latent distribution, shape [batch_size, dict_size]
-            log_var: Log variance of latent distribution, shape [batch_size, dict_size]
-            
-        Returns:
-            KL divergence (scalar)
         """
-        # Expand prior_means to match batch dimension [1, dict_size] -> [batch_size, dict_size]
+        # Expand prior_means to match batch dimension
         prior_means = self.prior_means.expand_as(mu)
         
         # Calculate KL divergence with non-zero mean prior
@@ -198,38 +281,93 @@ class VSAEMixtureTrainer(SAETrainer):
         
         return kl.sum(-1).mean()
     
+    def resample_neurons(self, deads, activations):
+        """
+        Resample dead neurons with high loss activations
+        """
+        with t.no_grad():
+            if deads.sum() == 0: 
+                return
+                
+            print(f"resampling {deads.sum().item()} neurons")
+
+            # Compute loss for each activation
+            losses = (activations - self.ae(activations)).norm(dim=-1)
+
+            # Sample input to create encoder/decoder weights from
+            n_resample = min([deads.sum(), losses.shape[0]])
+            indices = t.multinomial(losses, num_samples=n_resample, replacement=False)
+            sampled_vecs = activations[indices]
+
+            # Get norm of living neurons
+            alive_norm = self.ae.W_enc[:, ~deads].norm(dim=0).mean()
+
+            # Resample first n_resample dead neurons
+            deads[deads.nonzero()[n_resample:]] = False
+            self.ae.W_enc.data[:, deads] = (sampled_vecs - self.ae.b_dec).T * alive_norm * 0.2
+            self.ae.W_dec.data[deads, :] = ((sampled_vecs - self.ae.b_dec) / (sampled_vecs - self.ae.b_dec).norm(dim=-1, keepdim=True)).T
+            self.ae.b_enc.data[deads] = 0.
+            
+            # Also reset variance params if needed
+            if self.var_flag == 1 and hasattr(self.ae, 'W_enc_var'):
+                self.ae.W_enc_var.data[:, deads] = 0.
+                self.ae.b_enc_var.data[deads] = 0.
+
+            # Reset Adam parameters for dead neurons
+            self._reset_optimizer_stats(deads)
+    
+    def _reset_optimizer_stats(self, dead_mask):
+        """Reset optimizer state for resampled neurons"""
+        state_dict = self.optimizer.state_dict()['state']
+        
+        # Loop through the parameters in the optimizer
+        params_to_reset = []
+        for param_idx, param in enumerate(self.optimizer.param_groups[0]['params']):
+            if param_idx not in state_dict:
+                continue
+            
+            # Check which parameter this is and reset accordingly
+            if param.shape == self.ae.W_enc.shape:
+                params_to_reset.append((param_idx, 'W_enc', dead_mask))
+            elif param.shape == self.ae.b_enc.shape:
+                params_to_reset.append((param_idx, 'b_enc', dead_mask))
+            elif param.shape == self.ae.W_dec.shape:
+                params_to_reset.append((param_idx, 'W_dec', dead_mask))
+            elif hasattr(self.ae, 'W_enc_var') and param.shape == self.ae.W_enc_var.shape:
+                params_to_reset.append((param_idx, 'W_enc_var', dead_mask))
+            elif hasattr(self.ae, 'b_enc_var') and param.shape == self.ae.b_enc_var.shape:
+                params_to_reset.append((param_idx, 'b_enc_var', dead_mask))
+        
+        # Reset optimizer stats
+        for param_idx, param_type, mask in params_to_reset:
+            if param_type == 'W_enc' or param_type == 'W_enc_var':
+                state_dict[param_idx]['exp_avg'][:, mask] = 0.
+                state_dict[param_idx]['exp_avg_sq'][:, mask] = 0.
+            elif param_type == 'b_enc' or param_type == 'b_enc_var':
+                state_dict[param_idx]['exp_avg'][mask] = 0.
+                state_dict[param_idx]['exp_avg_sq'][mask] = 0.
+            elif param_type == 'W_dec':
+                state_dict[param_idx]['exp_avg'][mask, :] = 0.
+                state_dict[param_idx]['exp_avg_sq'][mask, :] = 0.
+    
     def loss(self, x, step: int, logging=False, **kwargs):
         """
         Compute the VSAE loss with mixture prior
-        
-        Args:
-            x: Input activations [batch_size, activation_dim]
-            step: Current training step
-            logging: Whether to return extended information for logging
-            
-        Returns:
-            Loss value or namedtuple with extended information
         """
         sparsity_scale = self.sparsity_warmup_fn(step)
         
-        # Center the input using the decoder bias
-        x_cent = x - self.b_dec
-        
-        # Encode to get mean of latent distribution
-        mu = F.relu(x_cent @ self.W_enc + self.b_enc)
-        
-        # Get log variance of latent distribution
-        if self.var_flag == 1:
-            log_var = F.relu(x_cent @ self.W_enc_var + self.b_enc_var)
-        else:
-            # Fixed variance when var_flag=0
+        # Get mean and log_var from encoder
+        if self.var_flag == 0:
+            mu = self.ae.encode(x)
             log_var = t.zeros_like(mu)
+        else:
+            mu, log_var = self.ae.encode(x, output_log_var=True)
         
         # Sample from the latent distribution using reparameterization trick
         z = self.reparameterize(mu, log_var)
         
         # Decode
-        x_hat = z @ self.W_dec + self.b_dec
+        x_hat = self.ae.decode(z)
         
         # Compute losses
         l2_loss = t.linalg.norm(x - x_hat, dim=-1).mean()
@@ -258,72 +396,9 @@ class VSAEMixtureTrainer(SAETrainer):
                 }
             )
     
-    def resample_neurons(self, deads, activations):
-        """
-        Resample dead neurons using activations from the batch.
-        
-        Args:
-            deads: Boolean tensor indicating dead neurons
-            activations: Tensor of activations to sample from
-            
-        Returns:
-            None
-        """
-        with t.no_grad():
-            if deads.sum() == 0: return
-            print(f"resampling {deads.sum().item()} neurons")
-
-            # compute loss for each activation
-            losses = (activations - self(activations)).norm(dim=-1)
-
-            # sample input to create encoder/decoder weights from
-            n_resample = min([deads.sum(), losses.shape[0]])
-            indices = t.multinomial(losses, num_samples=n_resample, replacement=False)
-            sampled_vecs = activations[indices]
-
-            # get norm of the living neurons
-            alive_norm = self.W_enc[:, ~deads].norm(dim=0).mean()
-
-            # resample first n_resample dead neurons
-            deads[deads.nonzero()[n_resample:]] = False
-            self.W_enc.data[:, deads] = (sampled_vecs - self.b_dec).T * alive_norm * 0.2
-            self.W_dec.data[deads, :] = ((sampled_vecs - self.b_dec) / (sampled_vecs - self.b_dec).norm(dim=-1, keepdim=True)).T
-            self.b_enc.data[deads] = 0.
-            
-            if self.var_flag == 1:
-                self.W_enc_var.data[:, deads] = 0.
-                self.b_enc_var.data[deads] = 0.
-
-            # reset Adam parameters for dead neurons
-            state_dict = self.optimizer.state_dict()['state']
-            ## encoder weight
-            for param_idx, param in enumerate(self.optimizer.param_groups[0]['params']):
-                if param.shape == self.W_enc.shape:
-                    state_dict[param_idx]['exp_avg'][:, deads] = 0.
-                    state_dict[param_idx]['exp_avg_sq'][:, deads] = 0.
-                elif param.shape == self.b_enc.shape:
-                    state_dict[param_idx]['exp_avg'][deads] = 0.
-                    state_dict[param_idx]['exp_avg_sq'][deads] = 0.
-                elif self.var_flag == 1 and param.shape == self.W_enc_var.shape:
-                    state_dict[param_idx]['exp_avg'][:, deads] = 0.
-                    state_dict[param_idx]['exp_avg_sq'][:, deads] = 0.
-                elif self.var_flag == 1 and param.shape == self.b_enc_var.shape:
-                    state_dict[param_idx]['exp_avg'][deads] = 0.
-                    state_dict[param_idx]['exp_avg_sq'][deads] = 0.
-                elif param.shape == self.W_dec.shape:
-                    state_dict[param_idx]['exp_avg'][deads, :] = 0.
-                    state_dict[param_idx]['exp_avg_sq'][deads, :] = 0.
-    
     def update(self, step, activations):
         """
         Perform a single training step
-        
-        Args:
-            step: Current training step
-            activations: Input activations
-            
-        Returns:
-            None
         """
         activations = activations.to(self.device)
         
@@ -336,102 +411,41 @@ class VSAEMixtureTrainer(SAETrainer):
         # Backward pass
         loss.backward()
         
-        # Remove gradients parallel to the decoder directions
-        with t.no_grad():
-            self._remove_parallel_component_of_grads()
-        
         # Update parameters
         self.optimizer.step()
         
         # Update learning rate
         self.scheduler.step()
         
-        # Normalize decoder
-        self.normalize_decoder()
-        
         # Resample dead neurons if needed
-        if self.resample_steps is not None and step % self.resample_steps == 0:
+        if self.resample_steps is not None and step > 0 and step % self.resample_steps == 0:
             self.resample_neurons(self.steps_since_active > self.resample_steps / 2, activations)
     
-    @t.no_grad()
-    def _remove_parallel_component_of_grads(self):
-        """
-        Remove the parallel component of gradients for decoder weights
-        This maintains the unit norm constraint during gradient descent
-        """
-        if self.W_dec.grad is None:
-            return
-            
-        W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-        W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(-1, keepdim=True) * W_dec_normed
-        self.W_dec.grad -= W_dec_grad_proj
+    # Dictionary interface methods - delegate to self.ae
+    def encode(self, x, **kwargs):
+        """Delegate to ae.encode"""
+        return self.ae.encode(x, **kwargs)
     
-    def forward(self, x):
-        """
-        Forward pass through the VAE
-        
-        Args:
-            x: Input activations
-            
-        Returns:
-            Reconstructed activations
-        """
-        x_cent = x - self.b_dec
-        
-        # Encode 
-        mu = F.relu(x_cent @ self.W_enc + self.b_enc)
-        
-        # For inference we use the mean without sampling
-        x_hat = mu @ self.W_dec + self.b_dec
-        
-        return x_hat
+    def decode(self, f):
+        """Delegate to ae.decode"""
+        return self.ae.decode(f)
     
-    def encode(self, x, deterministic=True):
-        """
-        Encode inputs to sparse features
-        
-        Args:
-            x: Input tensor
-            deterministic: If True, return mean without sampling
-            
-        Returns:
-            Encoded features
-        """
-        x_cent = x - self.b_dec
-        mu = F.relu(x_cent @ self.W_enc + self.b_enc)
-        
-        if deterministic:
-            return mu
-        
-        # Get log variance 
-        if self.var_flag == 1:
-            log_var = F.relu(x_cent @ self.W_enc_var + self.b_enc_var)
-        else:
-            log_var = t.zeros_like(mu)
-        
-        # Sample from the latent distribution
-        return self.reparameterize(mu, log_var)
+    def forward(self, x, output_features=False):
+        """Delegate to ae.forward"""
+        return self.ae.forward(x, output_features=output_features)
     
-    def decode(self, z):
-        """
-        Decode sparse features back to inputs
-        
-        Args:
-            z: Sparse features
-            
-        Returns:
-            Reconstructed inputs
-        """
-        return z @ self.W_dec + self.b_dec
+    def scale_biases(self, scale: float):
+        """Delegate to ae.scale_biases"""
+        self.ae.scale_biases(scale)
     
     @property
     def config(self):
-        """Return configuration for logging and saving"""
+        """Return configuration for logging"""
         return {
-            'dict_class': 'VSAEMixtureTrainer',
-            'trainer_class': 'VSAEMixtureTrainer',
-            'activation_dim': self.activation_dim,
-            'dict_size': self.dict_size,
+            'dict_class': self.ae.__class__.__name__,
+            'trainer_class': 'VSAEMixTrainer',
+            'activation_dim': self.ae.activation_dim,
+            'dict_size': self.ae.dict_size,
             'kl_coeff': self.kl_coeff,
             'warmup_steps': self.warmup_steps,
             'sparsity_warmup_steps': self.sparsity_warmup_steps,

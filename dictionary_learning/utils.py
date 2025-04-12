@@ -11,7 +11,7 @@ from .trainers.matryoshka_batch_top_k import MatryoshkaBatchTopKSAE
 from .dictionary import (
     AutoEncoder,
     GatedAutoEncoder,
-    AutoEncoderNew,
+    AutoEncoder,
     JumpReluAutoEncoder,
 )
 
@@ -69,8 +69,8 @@ def load_dictionary(base_path: str, device: str) -> tuple:
         dictionary = AutoEncoder.from_pretrained(ae_path, device=device)
     elif dict_class == "GatedAutoEncoder":
         dictionary = GatedAutoEncoder.from_pretrained(ae_path, device=device)
-    elif dict_class == "AutoEncoderNew":
-        dictionary = AutoEncoderNew.from_pretrained(ae_path, device=device)
+    elif dict_class == "AutoEncoder":
+        dictionary = AutoEncoder.from_pretrained(ae_path, device=device)
     elif dict_class == "AutoEncoderTopK":
         k = config["trainer"]["k"]
         dictionary = AutoEncoderTopK.from_pretrained(ae_path, k=k, device=device)

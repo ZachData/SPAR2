@@ -43,36 +43,62 @@ class Dictionary(ABC, nn.Module):
 class AutoEncoder(Dictionary, nn.Module):
     """
     A one-layer autoencoder.
+    
+    Can be configured in two ways:
+    1. Standard mode: Uses bias in the encoder input (old approach from Towards Monosemanticity)
+    2. April update mode: Uses bias in both encoder and decoder (newer approach)
     """
 
-    def __init__(self, activation_dim, dict_size):
+    def __init__(self, activation_dim, dict_size, use_april_update_mode=False):
         super().__init__()
         self.activation_dim = activation_dim
         self.dict_size = dict_size
-        self.bias = nn.Parameter(t.zeros(activation_dim))
+        self.use_april_update_mode = use_april_update_mode
+        
+        # Initialize encoder and decoder
         self.encoder = nn.Linear(activation_dim, dict_size, bias=True)
-        self.decoder = nn.Linear(dict_size, activation_dim, bias=False)
-
-        # initialize encoder and decoder weights
+        self.decoder = nn.Linear(dict_size, activation_dim, bias=use_april_update_mode)
+        
+        # Initialize weights
         w = t.randn(activation_dim, dict_size)
-        ## normalize columns of w
         w = w / w.norm(dim=0, keepdim=True) * 0.1
-        ## set encoder and decoder weights
         self.encoder.weight = nn.Parameter(w.clone().T)
         self.decoder.weight = nn.Parameter(w.clone())
+        
+        # Initialize biases
+        init.zeros_(self.encoder.bias)
+        if use_april_update_mode:
+            init.zeros_(self.decoder.bias)
+        else:
+            # In standard mode, we use a separate bias parameter
+            self.bias = nn.Parameter(t.zeros(activation_dim))
 
     def encode(self, x):
-        return nn.ReLU()(self.encoder(x - self.bias))
+        """
+        Encode a vector x in the activation space.
+        """
+        if self.use_april_update_mode:
+            return nn.ReLU()(self.encoder(x))
+        else:
+            return nn.ReLU()(self.encoder(x - self.bias))
 
     def decode(self, f):
-        return self.decoder(f) + self.bias
+        """
+        Decode a dictionary vector f.
+        """
+        if self.use_april_update_mode:
+            return self.decoder(f)
+        else:
+            return self.decoder(f) + self.bias
 
     def forward(self, x, output_features=False, ghost_mask=None):
         """
         Forward pass of an autoencoder.
-        x : activations to be autoencoded
-        output_features : if True, return the encoded features as well as the decoded x
-        ghost_mask : if not None, run this autoencoder in "ghost mode" where features are masked
+        
+        Args:
+            x: activations to be autoencoded
+            output_features: if True, return the encoded features as well as the decoded x
+            ghost_mask: if not None, run this autoencoder in "ghost mode" where features are masked
         """
         if ghost_mask is None:  # normal mode
             f = self.encode(x)
@@ -83,24 +109,40 @@ class AutoEncoder(Dictionary, nn.Module):
                 return x_hat
 
         else:  # ghost mode
-            f_pre = self.encoder(x - self.bias)
-            f_ghost = t.exp(f_pre) * ghost_mask.to(f_pre)
-            f = nn.ReLU()(f_pre)
-
-            x_ghost = self.decoder(
-                f_ghost
-            )  # note that this only applies the decoder weight matrix, no bias
-            x_hat = self.decode(f)
+            if self.use_april_update_mode:
+                f_pre = self.encoder(x)
+                f_ghost = t.exp(f_pre) * ghost_mask.to(f_pre)
+                f = nn.ReLU()(f_pre)
+                
+                x_ghost = self.decoder(f_ghost)
+                x_hat = self.decode(f)
+            else:
+                f_pre = self.encoder(x - self.bias)
+                f_ghost = t.exp(f_pre) * ghost_mask.to(f_pre)
+                f = nn.ReLU()(f_pre)
+                
+                x_ghost = self.decoder(f_ghost)
+                x_hat = self.decode(f)
+            
             if output_features:
                 return x_hat, x_ghost, f
             else:
                 return x_hat, x_ghost
 
     def scale_biases(self, scale: float):
+        """
+        Scale all bias parameters by a given factor.
+        """
         self.encoder.bias.data *= scale
-        self.bias.data *= scale
+        if self.use_april_update_mode:
+            self.decoder.bias.data *= scale
+        else:
+            self.bias.data *= scale
 
     def normalize_decoder(self):
+        """
+        Normalize decoder weights to have unit norm.
+        """
         norms = t.norm(self.decoder.weight, dim=0).to(dtype=self.decoder.weight.dtype, device=self.decoder.weight.device)
 
         if t.allclose(norms, t.ones_like(norms)):
@@ -123,15 +165,27 @@ class AutoEncoder(Dictionary, nn.Module):
         # Errors can be relatively large in larger SAEs due to floating point precision
         assert t.allclose(initial_output, new_output, atol=1e-4)
 
-
     @classmethod
     def from_pretrained(cls, path, dtype=t.float, device=None, normalize_decoder=True):
         """
         Load a pretrained autoencoder from a file.
+        
+        Args:
+            path: Path to the saved model
+            dtype: Data type to convert model to
+            device: Device to load model to
+            normalize_decoder: Whether to normalize decoder weights
+            
+        Returns:
+            Loaded autoencoder
         """
         state_dict = t.load(path)
         dict_size, activation_dim = state_dict["encoder.weight"].shape
-        autoencoder = cls(activation_dim, dict_size)
+        
+        # Determine mode based on state dict
+        use_april_update_mode = "decoder.bias" in state_dict
+        
+        autoencoder = cls(activation_dim, dict_size, use_april_update_mode=use_april_update_mode)
         autoencoder.load_state_dict(state_dict)
 
         # This is useful for doing analysis where e.g. feature activation magnitudes are important
@@ -261,7 +315,8 @@ class GatedAutoEncoder(Dictionary, nn.Module):
         self.mag_bias.data *= scale
         self.gate_bias.data *= scale
 
-    def from_pretrained(path, device=None):
+    @classmethod
+    def from_pretrained(cls, path, device=None):
         """
         Load a pretrained autoencoder from a file.
         """
@@ -364,61 +419,3 @@ class JumpReluAutoEncoder(Dictionary, nn.Module):
         if device is not None:
             device = autoencoder.W_enc.device
         return autoencoder.to(dtype=dtype, device=device)
-
-
-# TODO merge this with AutoEncoder
-class AutoEncoderNew(Dictionary, nn.Module):
-    """
-    The autoencoder architecture and initialization used in https://transformer-circuits.pub/2024/april-update/index.html#training-saes
-    """
-
-    def __init__(self, activation_dim, dict_size):
-        super().__init__()
-        self.activation_dim = activation_dim
-        self.dict_size = dict_size
-        self.encoder = nn.Linear(activation_dim, dict_size, bias=True)
-        self.decoder = nn.Linear(dict_size, activation_dim, bias=True)
-
-        # initialize encoder and decoder weights
-        w = t.randn(activation_dim, dict_size)
-        ## normalize columns of w
-        w = w / w.norm(dim=0, keepdim=True) * 0.1
-        ## set encoder and decoder weights
-        self.encoder.weight = nn.Parameter(w.clone().T)
-        self.decoder.weight = nn.Parameter(w.clone())
-
-        # initialize biases to zeros
-        init.zeros_(self.encoder.bias)
-        init.zeros_(self.decoder.bias)
-
-    def encode(self, x):
-        return nn.ReLU()(self.encoder(x))
-
-    def decode(self, f):
-        return self.decoder(f)
-
-    def forward(self, x, output_features=False):
-        """
-        Forward pass of an autoencoder.
-        x : activations to be autoencoded
-        """
-        if not output_features:
-            return self.decode(self.encode(x))
-        else:  # TODO rewrite so that x_hat depends on f
-            f = self.encode(x)
-            x_hat = self.decode(f)
-            # multiply f by decoder column norms
-            f = f * self.decoder.weight.norm(dim=0, keepdim=True)
-            return x_hat, f
-
-    def from_pretrained(path, device=None):
-        """
-        Load a pretrained autoencoder from a file.
-        """
-        state_dict = t.load(path)
-        dict_size, activation_dim = state_dict["encoder.weight"].shape
-        autoencoder = AutoEncoderNew(activation_dim, dict_size)
-        autoencoder.load_state_dict(state_dict)
-        if device is not None:
-            autoencoder.to(device)
-        return autoencoder

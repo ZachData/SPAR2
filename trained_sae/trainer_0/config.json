@@ -1,0 +1,30 @@
+{
+    "trainer": {
+        "dict_class": "AutoEncoder",
+        "trainer_class": "StandardTrainer",
+        "activation_dim": 2048,
+        "dict_size": 8192,
+        "lr": 0.001,
+        "l1_penalty": 0.001,
+        "warmup_steps": 1000,
+        "resample_steps": 3000,
+        "sparsity_warmup_steps": 2000,
+        "steps": 20000,
+        "decay_start": null,
+        "seed": null,
+        "device": "cuda",
+        "layer": 0,
+        "lm_name": "NeelNanda/GELU_1L512W_C4_Code",
+        "wandb_name": "StandardTrainer",
+        "submodule_name": null
+    },
+    "buffer": {
+        "d_submodule": 2048,
+        "io": "out",
+        "n_ctxs": 3000,
+        "ctx_len": 128,
+        "refresh_batch_size": 32,
+        "out_batch_size": 1024,
+        "device": "cuda"
+    }
+}

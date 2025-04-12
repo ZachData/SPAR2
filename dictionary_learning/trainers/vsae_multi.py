@@ -1,9 +1,10 @@
 """
-Implements Variational Sparse Autoencoder (VSAE) with multivariate Gaussian prior.
+Implements a Variational Sparse Autoencoder with multivariate Gaussian prior.
 This implementation is designed to handle general correlation structures in the latent space.
 """
 import torch as t
-from typing import Optional, Tuple, List
+import torch.nn.functional as F
+from typing import Optional, Tuple, List, Dict, Any
 from collections import namedtuple
 
 from ..trainers.trainer import SAETrainer, get_lr_schedule, get_sparsity_warmup_fn, ConstrainedAdam
@@ -28,7 +29,7 @@ class VSAEMultiGaussian(Dictionary, t.nn.Module):
         self.b_enc = t.nn.Parameter(t.zeros(dict_size, device=device))
         self.b_dec = t.nn.Parameter(t.zeros(activation_dim, device=device))
         
-        # Initialize parameters
+        # Initialize parameters with Kaiming uniform
         t.nn.init.kaiming_uniform_(self.W_enc)
         t.nn.init.kaiming_uniform_(self.W_dec)
         
@@ -38,17 +39,9 @@ class VSAEMultiGaussian(Dictionary, t.nn.Module):
     def encode(self, x, output_log_var=False):
         """
         Encode a vector x in the activation space.
-        
-        Args:
-            x: Input tensor of shape [batch_size, activation_dim]
-            output_log_var: Whether to output the log_var (always False for var_flag=0)
-            
-        Returns:
-            Encoded features of shape [batch_size, dict_size]
-            (and log_var if output_log_var=True)
         """
         x_cent = x - self.b_dec
-        z = t.nn.functional.relu(x_cent @ self.W_enc + self.b_enc)
+        z = F.relu(x_cent @ self.W_enc + self.b_enc)
         
         if output_log_var:
             log_var = t.zeros_like(z)  # Fixed variance when var_flag=0
@@ -58,25 +51,12 @@ class VSAEMultiGaussian(Dictionary, t.nn.Module):
     def decode(self, f):
         """
         Decode a dictionary vector f
-        
-        Args:
-            f: Dictionary vector of shape [batch_size, dict_size]
-            
-        Returns:
-            Decoded vector of shape [batch_size, activation_dim]
         """
         return f @ self.W_dec + self.b_dec
     
     def forward(self, x, output_features=False):
         """
         Forward pass through the autoencoder.
-        
-        Args:
-            x: Input tensor of shape [batch_size, activation_dim]
-            output_features: Whether to return features as well
-            
-        Returns:
-            Reconstructed input (and features if output_features=True)
         """
         f = self.encode(x)
         x_hat = self.decode(f)
@@ -86,11 +66,11 @@ class VSAEMultiGaussian(Dictionary, t.nn.Module):
         else:
             return x_hat
     
+    @t.no_grad()
     def normalize_decoder(self):
         """Normalize decoder weights to have unit norm"""
-        with t.no_grad():
-            norm = t.norm(self.W_dec, dim=1, keepdim=True)
-            self.W_dec.data = self.W_dec.data / norm.clamp(min=1e-6)
+        norm = t.norm(self.W_dec, dim=1, keepdim=True)
+        self.W_dec.data = self.W_dec.data / norm.clamp(min=1e-6)
     
     def scale_biases(self, scale: float):
         """Scale biases by a factor"""
@@ -101,7 +81,7 @@ class VSAEMultiGaussian(Dictionary, t.nn.Module):
     def from_pretrained(cls, path, device=None):
         """Load a pretrained autoencoder from a file."""
         state_dict = t.load(path)
-        dict_size, activation_dim = state_dict["W_enc"].shape
+        activation_dim, dict_size = state_dict["W_enc"].shape
         autoencoder = cls(activation_dim, dict_size)
         autoencoder.load_state_dict(state_dict)
         if device is not None:
@@ -127,20 +107,12 @@ class VSAEMultiGaussianLearned(VSAEMultiGaussian):
     def encode(self, x, output_log_var=False):
         """
         Encode a vector x in the activation space with learned variance
-        
-        Args:
-            x: Input tensor of shape [batch_size, activation_dim]
-            output_log_var: Whether to output the log_var
-            
-        Returns:
-            Encoded features of shape [batch_size, dict_size]
-            (and log_var if output_log_var=True)
         """
         x_cent = x - self.b_dec
-        z = t.nn.functional.relu(x_cent @ self.W_enc + self.b_enc)
+        z = F.relu(x_cent @ self.W_enc + self.b_enc)
         
         if output_log_var:
-            log_var = t.nn.functional.relu(x_cent @ self.W_enc_var + self.b_enc_var)
+            log_var = F.relu(x_cent @ self.W_enc_var + self.b_enc_var)
             return z, log_var
         return z
     
@@ -280,14 +252,6 @@ class VSAEMultiGaussianTrainer(SAETrainer):
     def loss(self, x, step: int, logging=False, **kwargs):
         """
         Compute the VSAE loss with multivariate Gaussian prior
-        
-        Args:
-            x: Input tensor of shape [batch_size, activation_dim]
-            step: Current training step
-            logging: Whether to return detailed loss components
-            
-        Returns:
-            Loss value (or loss details if logging=True)
         """
         sparsity_scale = self.sparsity_warmup_fn(step)
         
@@ -334,13 +298,6 @@ class VSAEMultiGaussianTrainer(SAETrainer):
     def _compute_kl_divergence(self, mu, log_var):
         """
         Compute KL divergence between approximate posterior and prior
-        
-        Args:
-            mu: Mean of approximate posterior
-            log_var: Log variance of approximate posterior
-            
-        Returns:
-            KL divergence
         """
         # For efficiency, compute on batch mean
         mu_avg = mu.mean(0)  # [dict_size]
@@ -367,12 +324,6 @@ class VSAEMultiGaussianTrainer(SAETrainer):
     def resample_neurons(self, activations):
         """
         Resample dead neurons with high loss activations
-        
-        Args:
-            activations: Batch of activations
-            
-        Returns:
-            Number of resampled neurons
         """
         with t.no_grad():
             if not self.activation_history:
@@ -475,10 +426,6 @@ class VSAEMultiGaussianTrainer(SAETrainer):
     def update(self, step, activations):
         """
         Update the autoencoder with a batch of activations
-        
-        Args:
-            step: Current training step
-            activations: Batch of activations
         """
         activations = activations.to(self.device)
         
